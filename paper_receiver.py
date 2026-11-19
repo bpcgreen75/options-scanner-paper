@@ -12,8 +12,10 @@ from hmac import compare_digest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Event, Thread
+from urllib.parse import urlsplit
 
 from paper_preview import ET, load, money, preview, underlying_key
+from robinhood_probe import CALLBACK_PATH, complete
 from tradier_quotes import QuoteError, TradierOptions
 
 
@@ -76,19 +78,25 @@ def save(db, event_id, payload):
 
 class Receiver(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
-        # The hosted webhook path includes a secret. Do not log request URLs.
+        # Webhook URLs and OAuth callback queries can carry secrets.
         return
 
     def do_GET(self):
         if self.path == "/healthz":
             self.reply(200, {"status": "ok", "mode": "paper"})
-        else:
-            self.reply(404, {"error": "Unknown endpoint"})
+            return
+        directory = getattr(self.server, "robinhood_probe_directory", None)
+        if directory and self.path.startswith(CALLBACK_PATH + "?"):
+            self.reply(*complete(directory, urlsplit(self.path).query))
+            return
+        self.reply(404, {"error": "Unknown endpoint"})
 
     def reply(self, status, body):
         data = json.dumps(body).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -179,6 +187,8 @@ def serve(database, port, host="127.0.0.1", token=None, quote_settings=None):
     with ThreadingHTTPServer((host, port), Receiver) as server:
         server.database = database
         server.webhook_path = f"{PATH}/{token}" if token else PATH
+        if token and os.getenv("PAPER_ROBINHOOD_PROBE") == "1":
+            server.robinhood_probe_directory = database.parent
         stop = Event()
         if quote_settings:
             Thread(target=quote_worker, args=(database, *quote_settings, stop), daemon=True).start()
