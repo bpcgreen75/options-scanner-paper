@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "event_type": "underlying_signal",
+  "event_id": "NASDAQ:NVDA|1|first_candle_rule|bullish|1795016400000",
+  "symbol": "NASDAQ:NVDA",
+  "strategy": "first_candle_rule",
+  "direction": "bullish",
+  "setup_timeframe_min": 5,
+  "confirmation_timeframe_min": 1,
+  "setup_close_ms": 1795016400000,
+  "confirmation_close_ms": 1795016460000,
+  "session_timezone": "America/New_York",
+  "currency": "USD",
+  "underlying_close": 165.27,
+  "breakout_level": 165.1,
+  "score": 8,
+  "max_score": 10,
+  "grade": "B+"
+}

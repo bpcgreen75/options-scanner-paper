@@ -1,0 +1,201 @@
+//@version=6
+indicator("AI Options Scanner | Phase 1", overlay = true)
+
+const string ET = "America/New_York"
+const int FIVE_MIN_MS = 300000
+
+bool bullEnabled = input.bool(true, "Bullish momentum", group = "Strategies")
+bool bearEnabled = input.bool(true, "Bearish momentum", group = "Strategies")
+bool openingEnabled = input.bool(true, "First Candle Rule (both directions)", group = "Strategies")
+int breakoutLength = input.int(5, "Prior 5-minute bars for momentum breakout", minval = 2, maxval = 50, group = "Strategies")
+bool restrictSymbols = input.bool(true, "Limit to the scanner watchlist", group = "Strategies")
+int latestHour = input.int(11, "Latest confirmation hour ET", minval = 9, maxval = 16, group = "Strategies")
+int latestMinute = input.int(30, "Latest confirmation minute ET", minval = 0, maxval = 59, group = "Strategies")
+
+bool useEma = input.bool(true, "EMA trend", group = "Scoring")
+bool useVwap = input.bool(true, "Regular-session VWAP", group = "Scoring")
+bool useRsi = input.bool(true, "RSI", group = "Scoring")
+bool useRvol = input.bool(true, "Relative volume", group = "Scoring")
+bool usePriceAction = input.bool(true, "Directional candle", group = "Scoring")
+bool strictFilters = input.bool(false, "Require every enabled component to pass", group = "Scoring")
+int fastLength = input.int(9, "Fast EMA", minval = 1, maxval = 200, group = "Scoring")
+int slowLength = input.int(21, "Slow EMA", minval = 2, maxval = 200, group = "Scoring")
+int rsiLength = input.int(14, "RSI length", minval = 2, maxval = 100, group = "Scoring")
+int bullRsiMin = input.int(55, "Bullish minimum RSI", minval = 51, maxval = 99, group = "Scoring")
+int bearRsiMax = input.int(45, "Bearish maximum RSI", minval = 1, maxval = 49, group = "Scoring")
+int rvolLength = input.int(20, "Prior 5-minute bars for relative volume", minval = 2, maxval = 100, group = "Scoring")
+float rvolMin = input.float(1.5, "Minimum relative volume", minval = 0.1, step = 0.1, group = "Scoring")
+
+string minimumGrade = input.string("B+", "Minimum alert grade", options = ["A", "B+", "B", "C"], group = "Alerts")
+bool alertsEnabled = input.bool(true, "Send alerts", group = "Alerts")
+bool sendFiveMinute = input.bool(false, "Also send standalone 5-minute alerts", group = "Alerts")
+bool showRange = input.bool(true, "Plot first candle high and low", group = "Display")
+bool showSignals = input.bool(true, "Show confirmed grades", group = "Display")
+
+bool oneMinute = timeframe.isminutes and timeframe.multiplier == 1
+bool fiveMinute = timeframe.isminutes and timeframe.multiplier == 5
+// The chart's data feed can have a different prefix from the listing exchange.
+bool putsOnly = syminfo.ticker == "PLTR"
+bool inWatchlist = switch syminfo.ticker
+    "NVDA" => true
+    "MU" => true
+    "PLTR" => true
+    "TSLA" => true
+    "QQQ" => true
+    "NKE" => true
+    "USO" => true
+    "SPCX" => true
+    "CRWV" => true
+    => false
+int maxPoints = (useEma ? 3 : 0) + (useVwap ? 2 : 0) + (useRsi ? 2 : 0) + (useRvol ? 2 : 0) + (usePriceAction ? 1 : 0)
+int latestET = latestHour * 60 + latestMinute
+
+if barstate.isfirst
+    if not chart.is_standard or not (oneMinute or fiveMinute)
+        runtime.error("Use standard candles on a 1-minute or 5-minute chart.")
+    if syminfo.session != session.regular or syminfo.timezone != ET or syminfo.currency != "USD" or not (syminfo.type == "stock" or syminfo.type == "fund")
+        runtime.error("Use regular trading hours on a US Eastern USD stock or ETF.")
+    if restrictSymbols and not inWatchlist
+        runtime.error("Choose NVDA, MU, PLTR, TSLA, QQQ, NKE, USO, SPCX or CRWV, or disable the watchlist limit.")
+    if useEma and fastLength >= slowLength
+        runtime.error("Fast EMA length must be shorter than slow EMA length.")
+    if maxPoints == 0 or latestET < 576 or latestET > 960
+        runtime.error("Enable at least one scoring component and set the latest confirmation between 09:36 and 16:00 ET.")
+
+etDay(int stamp) =>
+    year(stamp, ET) * 10000 + month(stamp, ET) * 100 + dayofmonth(stamp, ET)
+
+etMinute(int stamp) =>
+    hour(stamp, ET) * 60 + minute(stamp, ET)
+
+regularBar() =>
+    session.ismarket and not na(time(timeframe.period, "0930-1600:23456", ET))
+
+// This function always runs in a regular-session 5-minute context.
+// Every exported series is offset by one bar for safe higher-timeframe requests.
+priorSetup() =>
+    bool regular = regularBar()
+    int day = etDay(time)
+    bool opening = regular and etMinute(time) == 570 and time_close - time == FIVE_MIN_MS
+    var int openingDay = na
+    var float openingHigh = na
+    var float openingLow = na
+    var float sumVolume = na
+    var float sumValue = na
+    if opening
+        openingDay := day
+        openingHigh := high
+        openingLow := low
+        sumVolume := 0.0
+        sumValue := 0.0
+    bool rangeReady = regular and openingDay == day
+    if rangeReady and not na(volume)
+        sumVolume += volume
+        sumValue += hlc3 * volume
+
+    float vwap = rangeReady and sumVolume > 0 and not na(volume) ? sumValue / sumVolume : na
+    float fastEma = ta.ema(close, fastLength)
+    float slowEma = ta.ema(close, slowLength)
+    float rsi = ta.rsi(close, rsiLength)
+    float baseline = ta.sma(volume[1], rvolLength)
+    float rvol = baseline > 0 ? volume / baseline : na
+    float priorHigh = ta.highest(high[1], breakoutLength)
+    float priorLow = ta.lowest(low[1], breakoutLength)
+    bool emaReady = not na(close[slowLength - 1]) and not na(fastEma) and not na(slowEma)
+    bool ready = regular and (not useEma or emaReady) and (not useVwap or not na(vwap)) and (not useRsi or not na(rsi)) and (not useRvol or not na(rvol))
+    bool hasLookback = not na(high[breakoutLength])
+    bool volumePass = useRvol and rvol >= rvolMin
+    float candleRange = high - low
+    int bullPoints = (useEma and close > fastEma and fastEma > slowEma ? 3 : 0) + (useVwap and close > vwap ? 2 : 0) + (useRsi and rsi >= bullRsiMin ? 2 : 0) + (volumePass ? 2 : 0) + (usePriceAction and close > open and close - low >= 0.75 * candleRange ? 1 : 0)
+    int bearPoints = (useEma and close < fastEma and fastEma < slowEma ? 3 : 0) + (useVwap and close < vwap ? 2 : 0) + (useRsi and rsi <= bearRsiMax ? 2 : 0) + (volumePass ? 2 : 0) + (usePriceAction and close < open and high - close >= 0.75 * candleRange ? 1 : 0)
+
+    float bullMomentum = ready and hasLookback and close > priorHigh ? priorHigh : na
+    float bearMomentum = ready and hasLookback and close < priorLow ? priorLow : na
+    float bullOpening = ready and rangeReady and not opening and close > openingHigh and close[1] <= openingHigh ? openingHigh : na
+    float bearOpening = ready and rangeReady and not opening and close < openingLow and close[1] >= openingLow ? openingLow : na
+    float displayedHigh = rangeReady ? openingHigh : na
+    float displayedLow = rangeReady ? openingLow : na
+    [time_close[1], bullMomentum[1], bearMomentum[1], bullOpening[1], bearOpening[1], bullPoints[1], bearPoints[1], displayedHigh[1], displayedLow[1]]
+
+[setupEnd, bullMomentumLevel, bearMomentumLevel, bullOpeningLevel, bearOpeningLevel, bullScore, bearScore, rangeHigh, rangeLow] = if oneMinute
+    request.security(syminfo.tickerid, "5", priorSetup(), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+else
+    priorSetup()
+
+gradeRank(int points) =>
+    points * 100 >= maxPoints * 90 ? 4 : points * 100 >= maxPoints * 80 ? 3 : points * 100 >= maxPoints * 70 ? 2 : 1
+
+gradeName(int rank) =>
+    rank == 4 ? "A" : rank == 3 ? "B+" : rank == 2 ? "B" : "C"
+
+jsonString(string value) =>
+    string escaped = str.replace_all(value, "\\", "\\\\")
+    escaped := str.replace_all(escaped, "\"", "\\\"")
+    escaped := str.replace_all(escaped, "\n", "\\n")
+    escaped := str.replace_all(escaped, "\t", "\\t")
+    "\"" + escaped + "\""
+
+int minRank = minimumGrade == "A" ? 4 : minimumGrade == "B+" ? 3 : minimumGrade == "B" ? 2 : 1
+bool canConfirm = barstate.isconfirmed and regularBar() and not na(setupEnd) and etDay(time) == etDay(setupEnd) and time >= setupEnd and time_close <= setupEnd + FIVE_MIN_MS and etMinute(time_close) <= latestET
+
+confirmed(float level, bool bullish, int points, int lastSetup) =>
+    canConfirm and not na(level) and (na(lastSetup) or lastSetup != setupEnd) and (not strictFilters or points == maxPoints) and (bullish ? close > level and close > open : close < level and close < open)
+
+publish(string strategyId, string direction, float level, int points) =>
+    int rank = gradeRank(points)
+    if alertsEnabled and (oneMinute or sendFiveMinute) and barstate.isconfirmed and barstate.isrealtime and rank >= minRank
+        string symbol = ticker.standard(syminfo.tickerid)
+        string eventId = symbol + "|" + str.tostring(timeframe.multiplier) + "|" + strategyId + "|" + direction + "|" + str.tostring(setupEnd)
+        string message = "{\"schema_version\":1,\"event_type\":\"underlying_signal\",\"event_id\":" + jsonString(eventId)
+        message += ",\"symbol\":" + jsonString(symbol) + ",\"strategy\":" + jsonString(strategyId) + ",\"direction\":" + jsonString(direction)
+        message += ",\"setup_timeframe_min\":5,\"confirmation_timeframe_min\":" + str.tostring(timeframe.multiplier)
+        message += ",\"setup_close_ms\":" + str.tostring(setupEnd) + ",\"confirmation_close_ms\":" + str.tostring(time_close)
+        message += ",\"session_timezone\":\"America/New_York\",\"currency\":\"USD\",\"underlying_close\":" + str.tostring(close, format.mintick)
+        message += ",\"breakout_level\":" + str.tostring(level, format.mintick) + ",\"score\":" + str.tostring(points) + ",\"max_score\":" + str.tostring(maxPoints) + ",\"grade\":" + jsonString(gradeName(rank)) + "}"
+        alert(message, alert.freq_all)
+    rank
+
+var int lastBullMomentum = na
+var int lastBearMomentum = na
+var int lastBullOpening = na
+var int lastBearOpening = na
+bool bm = not putsOnly and bullEnabled and confirmed(bullMomentumLevel, true, bullScore, lastBullMomentum)
+bool sm = bearEnabled and confirmed(bearMomentumLevel, false, bearScore, lastBearMomentum)
+bool bo = not putsOnly and openingEnabled and confirmed(bullOpeningLevel, true, bullScore, lastBullOpening)
+bool so = openingEnabled and confirmed(bearOpeningLevel, false, bearScore, lastBearOpening)
+
+if bm
+    lastBullMomentum := setupEnd
+    publish("bullish_momentum", "bullish", bullMomentumLevel, bullScore)
+if sm
+    lastBearMomentum := setupEnd
+    publish("bearish_momentum", "bearish", bearMomentumLevel, bearScore)
+if bo
+    lastBullOpening := setupEnd
+    publish("first_candle_rule", "bullish", bullOpeningLevel, bullScore)
+if so
+    lastBearOpening := setupEnd
+    publish("first_candle_rule", "bearish", bearOpeningLevel, bearScore)
+
+bool showTodayRange = showRange and regularBar() and etDay(time) == etDay(setupEnd)
+plot(showTodayRange ? rangeHigh : na, "First candle high", color.teal, style = plot.style_linebr)
+plot(showTodayRange ? rangeLow : na, "First candle low", color.orange, style = plot.style_linebr)
+plot(bullScore, "5m setup bullish points", display = display.data_window)
+plot(bearScore, "5m setup bearish points", display = display.data_window)
+plot(maxPoints, "Maximum points", display = display.data_window)
+bool longSignal = showSignals and (bm or bo)
+bool shortSignal = showSignals and (sm or so)
+int longRank = gradeRank(bullScore)
+int shortRank = gradeRank(bearScore)
+plotshape(longSignal and longRank == 4, "Bullish A", shape.labelup, location.belowbar, color.teal, text = "A", textcolor = color.white, size = size.tiny)
+plotshape(longSignal and longRank == 3, "Bullish B+", shape.labelup, location.belowbar, color.teal, text = "B+", textcolor = color.white, size = size.tiny)
+plotshape(longSignal and longRank == 2, "Bullish B", shape.labelup, location.belowbar, color.teal, text = "B", textcolor = color.white, size = size.tiny)
+plotshape(longSignal and longRank == 1, "Bullish C", shape.labelup, location.belowbar, color.teal, text = "C", textcolor = color.white, size = size.tiny)
+plotshape(shortSignal and shortRank == 4, "Bearish A", shape.labeldown, location.abovebar, color.maroon, text = "A", textcolor = color.white, size = size.tiny)
+plotshape(shortSignal and shortRank == 3, "Bearish B+", shape.labeldown, location.abovebar, color.maroon, text = "B+", textcolor = color.white, size = size.tiny)
+plotshape(shortSignal and shortRank == 2, "Bearish B", shape.labeldown, location.abovebar, color.maroon, text = "B", textcolor = color.white, size = size.tiny)
+plotshape(shortSignal and shortRank == 1, "Bearish C", shape.labeldown, location.abovebar, color.maroon, text = "C", textcolor = color.white, size = size.tiny)
+plot(bm ? bullMomentumLevel : na, "Confirmed bullish momentum level", display = display.data_window)
+plot(sm ? bearMomentumLevel : na, "Confirmed bearish momentum level", display = display.data_window)
+plot(bo ? bullOpeningLevel : na, "Confirmed first candle bullish level", display = display.data_window)
+plot(so ? bearOpeningLevel : na, "Confirmed first candle bearish level", display = display.data_window)
